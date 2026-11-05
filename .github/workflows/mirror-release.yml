@@ -1,0 +1,60 @@
+name: Mirror verified VINote release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published source release tag
+        required: true
+      manifest_sha256:
+        description: SHA256 of the verified source manifest.json
+        required: true
+permissions:
+  contents: write
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      EXPECTED: ${{ inputs.manifest_sha256 }}
+    steps:
+      - name: Validate request
+        run: |
+          python - <<'PY'
+          import os,re
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+',os.environ['TAG'])
+          assert re.fullmatch(r'[0-9a-f]{64}',os.environ['EXPECTED'])
+          PY
+      - name: Download published source assets
+        run: gh release download "$TAG" --repo orulink-ai/VINote --dir bundle
+      - name: Verify all asset hashes and update metadata
+        run: |
+          python - <<'PY'
+          import os,json,hashlib
+          from pathlib import Path
+          p=Path('bundle'); raw=(p/'manifest.json').read_bytes()
+          assert hashlib.sha256(raw).hexdigest()==os.environ['EXPECTED']
+          manifest=json.loads(raw); version=os.environ['TAG'][1:]
+          assert manifest['version']==version and manifest['channel']=='release'
+          names=[]
+          for item in manifest['files']:
+              name=item['name']
+              assert Path(name).name==name and '/' not in name and '\\' not in name
+              assert hashlib.sha256((p/name).read_bytes()).hexdigest()==item['sha256']
+              names.append(name)
+          assert set(x.name for x in p.iterdir())==set(names+['manifest.json','latest.json'])
+          latest=json.loads((p/'latest.json').read_text())
+          assert latest['version']==version
+          prefix='https://github.com/Ro-In-AI/Vinote-public/releases/download/'+os.environ['TAG']+'/'
+          from urllib.parse import unquote
+          for platform in latest['platforms'].values():
+              assert platform['url'].startswith(prefix)
+              name=unquote(platform['url'][len(prefix):])
+              assert name in names and name+'.sig' in names
+              assert (p/(name+'.sig')).read_text().strip()==platform['signature'].strip()
+          PY
+      - name: Upload only to an existing draft
+        run: |
+          test "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          gh release upload "$TAG" ./bundle/* --repo "$GITHUB_REPOSITORY" --clobber
